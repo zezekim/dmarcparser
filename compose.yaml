@@ -1,0 +1,109 @@
+services:
+  mailserver:
+    image: ghcr.io/docker-mailserver/docker-mailserver:15.1.0
+    container_name: dmarc-mailserver
+    hostname: ${MAIL_HOSTNAME:-mail.example.org}
+    ports:
+      # Host Postfix owns port 25 and relays the report domains here.
+      - "127.0.0.1:2525:25"
+      # IMAPS for external mail clients (Thunderbird etc.), optional.
+      - "993:993"
+    volumes:
+      - ./docker-data/dms/mail-data/:/var/mail/
+      - ./docker-data/dms/mail-state/:/var/mail-state/
+      - ./docker-data/dms/mail-logs/:/var/log/mail/
+      - ./docker-data/dms/config/:/tmp/docker-mailserver/
+      - ./docker-data/certs/:/tmp/dms/custom-certs/:ro
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - SSL_TYPE=manual
+      - SSL_CERT_PATH=/tmp/dms/custom-certs/cert.pem
+      - SSL_KEY_PATH=/tmp/dms/custom-certs/key.pem
+      # Receive-only mailbox for DMARC rua/ruf reports - keep it lean.
+      - ENABLE_CLAMAV=0
+      - ENABLE_AMAVIS=0
+      - ENABLE_RSPAMD=0
+      - ENABLE_SPAMASSASSIN=0
+      - ENABLE_OPENDKIM=0
+      - ENABLE_FAIL2BAN=0
+      # Mail arrives relayed from the host Postfix (docker gateway IP), so the
+      # real client IP is never visible here - SPF checks would always fail.
+      - ENABLE_POLICYD_SPF=0
+      - ENABLE_OPENDMARC=0
+      - SPOOF_PROTECTION=0
+      - PERMIT_DOCKER=none
+    restart: unless-stopped
+    stop_grace_period: 1m
+    healthcheck:
+      test: "ss --listening --tcp | grep -P 'LISTEN.+:smtp' || exit 1"
+      timeout: 3s
+      retries: 0
+
+  roundcube:
+    image: roundcube/roundcubemail:1.6.11-apache
+    container_name: dmarc-roundcube
+    depends_on:
+      - mailserver
+    ports:
+      # Public access goes through the mxsentinel Caddy at
+      # https://<your-host>/roundcube/ - this is just a local fallback.
+      - "127.0.0.1:8090:80"
+    networks:
+      - default
+      - mxsentinel
+    environment:
+      - ROUNDCUBEMAIL_DEFAULT_HOST=tls://mailserver
+      - ROUNDCUBEMAIL_DEFAULT_PORT=143
+      - ROUNDCUBEMAIL_SMTP_SERVER=tls://mailserver
+      - ROUNDCUBEMAIL_SMTP_PORT=587
+      # Public URL is https://<your-host>/roundcube/ (mxsentinel Caddy).
+      - ROUNDCUBEMAIL_REQUEST_PATH=/roundcube
+    volumes:
+      - ./roundcube/custom.php:/var/roundcube/config/custom.php:ro
+      - ./roundcube/apache-prefix.conf:/etc/apache2/conf-enabled/zz-roundcube-prefix.conf:ro
+      - roundcube-db:/var/roundcube/db
+    restart: unless-stopped
+
+  # DMARC report parser + ingestion API (see SPEC.md). Polls the mailbox over
+  # IMAPS and writes into the dmarc viewer's Postgres (dmarc_default network).
+  parser:
+    build: ./parser
+    container_name: dmarc-parser
+    depends_on:
+      - mailserver
+    environment:
+      - PARSER_DATABASE_URL=${PARSER_DATABASE_URL}
+      - PARSER_API_KEYS=${PARSER_API_KEYS}
+      - PARSER_IMAP_ADDR=mailserver:993
+      - PARSER_IMAP_USER=${PARSER_IMAP_USER:-dmarc@example.org}
+      - PARSER_IMAP_PASSWORD_FILE=/run/secrets/mailbox-password
+      # The mailserver cert is self-signed.
+      - PARSER_IMAP_TLS_SKIP_VERIFY=true
+      - PARSER_POLL_INTERVAL=5m
+      - PARSER_WEBHOOK_URL=${PARSER_WEBHOOK_URL:-}
+      - PARSER_WEBHOOK_SECRET=${PARSER_WEBHOOK_SECRET:-}
+    volumes:
+      - ./.mailbox-password:/run/secrets/mailbox-password:ro
+    ports:
+      # Host-local API; containers use http://dmarcparser:8080 instead.
+      - "127.0.0.1:8081:8080"
+    networks:
+      default: {}
+      dmarc: {}
+      mxsentinel:
+        aliases:
+          - dmarcparser
+    restart: unless-stopped
+
+volumes:
+  roundcube-db:
+
+networks:
+  # Network of the mxsentinel stack, whose Caddy reverse-proxies /roundcube.
+  mxsentinel:
+    name: mxsentinel_default
+    external: true
+  # Network of the dmarc viewer stack — gives the parser the `db` hostname.
+  dmarc:
+    name: dmarc_default
+    external: true

@@ -1,0 +1,9 @@
+# Secrets — never commit
+.env
+.mailbox-password
+
+# Runtime state: mail spool, mail-server config (account hashes), TLS keys, logs
+docker-data/
+
+# Local tooling
+.claude/
