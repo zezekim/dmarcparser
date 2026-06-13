@@ -1,10 +1,16 @@
 // Package api is the REST surface: ingest, query, poller control, health.
+// Auth is scoped API keys (PARSER_API_KEYS name=key=scopes) with per-key
+// rate limiting; the key name travels in the request context for logs/audit.
 package api
 
 import (
+	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -12,26 +18,82 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"golang.org/x/time/rate"
 
+	"dmarcparser/internal/audit"
 	"dmarcparser/internal/config"
 	"dmarcparser/internal/metrics"
+	"dmarcparser/internal/pipeline"
 	"dmarcparser/internal/poller"
 	"dmarcparser/internal/report"
 	"dmarcparser/internal/store"
 	"dmarcparser/internal/webhook"
 )
 
-type Server struct {
-	cfg   *config.Config
-	store *store.Store
-	pol   *poller.Poller
-	m     *metrics.Metrics
-	wh    *webhook.Notifier
-	log   *slog.Logger
+// AlertStater reports watchdog rule states for /healthz ("ok"/"firing").
+type AlertStater interface {
+	States() map[string]string
 }
 
-func New(cfg *config.Config, st *store.Store, pol *poller.Poller, m *metrics.Metrics, wh *webhook.Notifier, log *slog.Logger) http.Handler {
-	s := &Server{cfg: cfg, store: st, pol: pol, m: m, wh: wh, log: log.With("component", "api")}
+type ctxKey int
+
+const (
+	ctxKeyName ctxKey = iota
+	ctxKeyScopes
+)
+
+// KeyName returns the authenticated API key name from the request context
+// ("" when unauthenticated). Used in logs and by the audit middleware.
+func KeyName(ctx context.Context) string {
+	name, _ := ctx.Value(ctxKeyName).(string)
+	return name
+}
+
+func scopes(ctx context.Context) map[string]bool {
+	sc, _ := ctx.Value(ctxKeyScopes).(map[string]bool)
+	return sc
+}
+
+// RequireScope is route-group middleware enforcing one scope from
+// {read, ingest, admin}. It relies on the auth middleware having stored the
+// key's scopes in the context.
+func RequireScope(scope string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !scopes(r.Context())[scope] {
+				writeErr(w, http.StatusForbidden, "API key lacks scope "+scope)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+type Server struct {
+	cfg    *config.Config
+	store  *store.Store
+	pol    *poller.Poller
+	m      *metrics.Metrics
+	wh     *webhook.Notifier
+	reg    *pipeline.Registry
+	alerts AlertStater // nil-able
+	log    *slog.Logger
+
+	limiters map[string]*rate.Limiter // per key name, built at startup
+}
+
+func New(cfg *config.Config, st *store.Store, pol *poller.Poller, m *metrics.Metrics,
+	wh *webhook.Notifier, reg *pipeline.Registry, alerts AlertStater,
+	plat *PlatformDeps, log *slog.Logger) http.Handler {
+
+	s := &Server{cfg: cfg, store: st, pol: pol, m: m, wh: wh, reg: reg, alerts: alerts,
+		log: log.With("component", "api"), limiters: map[string]*rate.Limiter{}}
+	if cfg.RateLimitRPS > 0 {
+		burst := int(math.Ceil(cfg.RateLimitRPS * 3))
+		for _, k := range cfg.APIKeys {
+			s.limiters[k.Name] = rate.NewLimiter(rate.Limit(cfg.RateLimitRPS), burst)
+		}
+	}
 
 	r := chi.NewRouter()
 	r.Use(middleware.RealIP, middleware.Recoverer)
@@ -40,17 +102,44 @@ func New(cfg *config.Config, st *store.Store, pol *poller.Poller, m *metrics.Met
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		io.WriteString(w, m.Render())
 	})
+	RegisterPlatformOpenAPI(r) // unauthenticated GET /api/v1/openapi.json
+
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Use(s.auth)
-		r.Post("/ingest", s.ingest)
-		r.Post("/poll", s.triggerPoll)
-		r.Get("/status", s.status)
-		r.Get("/reports", s.listReports)
-		r.Get("/reports/{serial}", s.getReport)
+		if plat != nil && plat.Audit != nil {
+			r.Use(plat.Audit.Middleware(KeyName))
+		}
+
+		r.Group(func(r chi.Router) {
+			r.Use(RequireScope(config.ScopeIngest))
+			r.Post("/ingest", s.ingest)
+		})
+		r.Group(func(r chi.Router) {
+			r.Use(RequireScope(config.ScopeAdmin))
+			r.Post("/poll", s.triggerPoll)
+			if plat != nil {
+				RegisterPlatformAdmin(r, plat) // audit, requeue-failed, webhooks/replay, digest admin
+			}
+			RegisterIntelAdmin(r, st, log) // sources/ack
+		})
+		r.Group(func(r chi.Router) {
+			r.Use(RequireScope(config.ScopeRead))
+			r.Get("/status", s.status)
+			r.Get("/reports", s.listReports)
+			r.Get("/reports/{serial}", s.getReport)
+			RegisterIntel(r, st, log)    // sources, ips, domain sources
+			RegisterStats(r, st, log)    // stats, domains, health, readiness
+			RegisterReports2(r, st, log) // selectors, tlsrpt, forensic
+			if plat != nil {
+				RegisterPlatform(r, plat) // export, raw report download
+			}
+		})
 	})
 	return r
 }
 
+// auth validates the API key (constant-time), applies the per-key rate
+// limit, and stores key name + scopes in the request context.
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		key := r.Header.Get("X-API-Key")
@@ -61,12 +150,43 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			writeErr(w, http.StatusServiceUnavailable, "no API keys configured")
 			return
 		}
-		if _, ok := s.cfg.APIKeys[key]; !ok {
+		match, ok := s.matchKey(key)
+		if !ok {
 			writeErr(w, http.StatusUnauthorized, "invalid or missing API key")
 			return
 		}
-		next.ServeHTTP(w, r)
+		if lim := s.limiters[match.Name]; lim != nil {
+			res := lim.Reserve()
+			delay := res.Delay()
+			if !res.OK() || delay > 0 {
+				if res.OK() {
+					res.Cancel()
+				}
+				retry := int64(math.Ceil(math.Max(delay.Seconds(), 1)))
+				w.Header().Set("Retry-After", strconv.FormatInt(retry, 10))
+				writeErr(w, http.StatusTooManyRequests, "rate limit exceeded")
+				return
+			}
+		}
+		ctx := context.WithValue(r.Context(), ctxKeyName, match.Name)
+		ctx = context.WithValue(ctx, ctxKeyScopes, match.Scopes)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// matchKey compares the candidate against every configured key via
+// constant-time hash comparison (hashing first hides length differences).
+func (s *Server) matchKey(candidate string) (config.APIKey, bool) {
+	ch := sha256.Sum256([]byte(candidate))
+	var found config.APIKey
+	ok := false
+	for _, k := range s.cfg.APIKeys {
+		kh := sha256.Sum256([]byte(k.Key))
+		if subtle.ConstantTimeCompare(ch[:], kh[:]) == 1 && !ok {
+			found, ok = k, true
+		}
+	}
+	return found, ok
 }
 
 type ingestResult struct {
@@ -122,13 +242,17 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 		s.m.ReportsIngested.Add(1)
 		s.m.RecordsInserted.Add(int64(res.Records))
 		s.log.Info("report ingested via api", "serial", res.Serial,
-			"domain", rep.Domain, "org", rep.Org, "records", res.Records)
-		s.wh.Notify(webhook.Event{
-			Serial: res.Serial, Domain: rep.Domain, Org: rep.Org,
-			ReportID: rep.ReportID, DateBegin: rep.Begin, DateEnd: rep.End,
-			Records: res.Records, Messages: res.Messages, Source: "api",
-		})
+			"domain", rep.Domain, "org", rep.Org, "records", res.Records,
+			"key", KeyName(r.Context()))
+		s.reg.Emit(r.Context(), pipeline.IngestEvent{Report: rep, Result: res, Source: "api"})
 	}
+	var serials []int64
+	for _, res := range results {
+		if !res.Duplicate {
+			serials = append(serials, res.Serial)
+		}
+	}
+	audit.AddSerials(r.Context(), serials...)
 	code := http.StatusOK
 	if anyNew {
 		code = http.StatusCreated
@@ -170,7 +294,8 @@ type errBody string
 
 func (e errBody) Error() string { return string(e) }
 
-func (s *Server) triggerPoll(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) triggerPoll(w http.ResponseWriter, r *http.Request) {
+	s.log.Info("poll triggered", "key", KeyName(r.Context()))
 	s.pol.TriggerNow()
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "poll triggered"})
 }
@@ -247,11 +372,12 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	type health struct {
-		Status string `json:"status"`
-		DB     string `json:"db"`
-		Poller string `json:"poller"`
+		Status string            `json:"status"`
+		DB     string            `json:"db"`
+		Poller string            `json:"poller"`
+		Alerts map[string]string `json:"alerts"`
 	}
-	h := health{Status: "ok", DB: "ok", Poller: "ok"}
+	h := health{Status: "ok", DB: "ok", Poller: "ok", Alerts: map[string]string{}}
 	code := http.StatusOK
 
 	if err := s.store.Ping(r.Context()); err != nil {
@@ -268,6 +394,9 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		h.Poller = "disabled"
+	}
+	if s.alerts != nil {
+		h.Alerts = s.alerts.States()
 	}
 	writeJSON(w, code, h)
 }

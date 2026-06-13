@@ -39,6 +39,12 @@ type Record struct {
 	SPFAlign    string // NOT NULL in schema
 	DKIMAlign   string
 	HeaderFrom  *string
+
+	// Full auth_results entries as reported. The collapsed fields above keep
+	// feeding the frozen rptrecord columns; these feed dkim_auth (selector
+	// inventory) and anything else that needs every entry.
+	DKIMAll []AuthResult
+	SPFAll  []AuthResult
 }
 
 // XML wire format.
@@ -83,14 +89,17 @@ type xmlRecord struct {
 		HeaderFrom string `xml:"header_from"`
 	} `xml:"identifiers"`
 	Auth struct {
-		DKIM []authResult `xml:"dkim"`
-		SPF  []authResult `xml:"spf"`
+		DKIM []AuthResult `xml:"dkim"`
+		SPF  []AuthResult `xml:"spf"`
 	} `xml:"auth_results"`
 }
 
-type authResult struct {
-	Domain string `xml:"domain"`
-	Result string `xml:"result"`
+// AuthResult is one auth_results/dkim or auth_results/spf entry. Selector is
+// only ever populated for DKIM.
+type AuthResult struct {
+	Domain   string `xml:"domain"`
+	Selector string `xml:"selector"`
+	Result   string `xml:"result"`
 }
 
 var (
@@ -149,6 +158,8 @@ func ParseXML(data []byte) (*Report, error) {
 			SPFAlign:   normalize(xr.Row.Policy.SPF, aligns),
 			DKIMAlign:  normalize(xr.Row.Policy.DKIM, aligns),
 			HeaderFrom: optStr(xr.Identifiers.HeaderFrom, 255),
+			DKIMAll:    xr.Auth.DKIM,
+			SPFAll:     xr.Auth.SPF,
 		}
 		if d := strings.ToLower(strings.TrimSpace(xr.Row.Policy.Disposition)); d != "" {
 			v := normalize(d, dispositions)
@@ -185,7 +196,7 @@ func ParseXML(data []byte) (*Report, error) {
 
 // pickAuth mirrors dmarcts-report-parser: prefer the entry that passed,
 // otherwise take the first one.
-func pickAuth(results []authResult) (domain, result string, ok bool) {
+func pickAuth(results []AuthResult) (domain, result string, ok bool) {
 	if len(results) == 0 {
 		return "", "", false
 	}

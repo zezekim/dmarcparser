@@ -25,10 +25,21 @@ exposes a REST API so other services can ingest, query, and get notified.
    - DB/transient errors: message is left UNSEEN in INBOX and retried next cycle
      (bodies are fetched with PEEK so retries are possible).
 2. **REST API** — ingest reports directly (bypass email), query stored data,
-   trigger/inspect the poller, health and Prometheus metrics.
-3. **Webhook** — optionally POST a JSON summary of every newly stored report to
-   `PARSER_WEBHOOK_URL` (HMAC-SHA256 signed), so downstream services can react
-   without polling.
+   sender intelligence, analytics/readiness, selectors/TLS-RPT/forensic,
+   export, audit, digest admin, trigger/inspect the poller, health and
+   Prometheus metrics. Auth is **scoped API keys** with per-key rate limiting.
+3. **Webhook** — POST signed JSON events to every `PARSER_WEBHOOK_URLS`
+   endpoint (HMAC-SHA256), seven event kinds, failed deliveries deadlettered
+   and replayable, so downstream services react without polling.
+4. **Pipeline** — every non-duplicate aggregate save (poller or API) fans out
+   to in-order observers (webhook → rollup → selectors → enrichment).
+5. **Background services** — enrichment (PTR/ASN/country/sender-class via Team
+   Cymru DNS), daily `dmarc_agg_daily` rollups, raw-xml/mail retention, an
+   alerting watchdog, a weekly email digest, and a nightly backup sidecar.
+
+All v2 data lives in **additive** tables created idempotently at startup by
+`internal/migrate`; the frozen `report`/`rptrecord` tables are never altered
+destructively. The viewer reads the same tables directly.
 
 ## Payload handling
 
@@ -70,19 +81,36 @@ inserts no records. Report + records are written in one transaction.
 Base URL: `http://127.0.0.1:8081` on the host, `http://dmarcparser:8080` from
 containers on the `mxsentinel_default` or `dmarcparser_default` networks.
 
-Auth: every `/api/v1/*` route requires a key from `PARSER_API_KEYS`
-(comma-separated) via `Authorization: Bearer <key>` or `X-API-Key: <key>`.
-`/healthz` and `/metrics` are unauthenticated.
+Auth: every `/api/v1/*` route (except `/api/v1/openapi.json`) requires a key
+from `PARSER_API_KEYS` (entries `name=key=scopes`, scopes pipe-separated from
+`{read, ingest, admin}` or `*`; bare key = name `default`, all scopes) via
+`Authorization: Bearer <key>` or `X-API-Key: <key>`. Constant-time compare; key
+name flows into context/logs/audit. Per-key token-bucket rate limit
+(`PARSER_RATE_LIMIT_RPS`, default 10, burst 3×; 429 + `Retry-After`). Missing
+key → 401, missing scope → 403. `/healthz`, `/metrics`, `/api/v1/openapi.json`
+are unauthenticated. Full machine contract: `openapi.yaml` (served as
+`GET /api/v1/openapi.json`).
 
-| Method & path                  | Description |
-|--------------------------------|-------------|
-| `POST /api/v1/ingest`          | Ingest report(s). Body: raw XML, gzip, or zip (any `Content-Type`), or `multipart/form-data` with a file field. Returns per-report results. `201` if anything new was stored, `200` if everything was a duplicate, `400` if no parseable report. |
-| `POST /api/v1/poll`            | Trigger an immediate IMAP poll cycle (async). `202`. |
-| `GET  /api/v1/status`          | Poller state + lifetime counters + DB totals. |
-| `GET  /api/v1/reports`         | List reports. Query: `domain`, `org`, `since`, `until` (RFC 3339 or `2006-01-02`), `limit` (≤500, default 50), `offset`. |
-| `GET  /api/v1/reports/{serial}`| One report incl. all records (IPs rendered as strings). |
-| `GET  /healthz`                | `200` when DB is reachable and the last successful poll is recent (< 3× interval + 2m); `503` otherwise. |
-| `GET  /metrics`                | Prometheus text format. |
+| Method & path | Scope | Description |
+|---|---|---|
+| `POST /api/v1/ingest` | ingest | Ingest aggregate report(s): raw XML/gzip/zip or multipart file. `201` new / `200` all-dup / `400` non-report. |
+| `POST /api/v1/poll` | admin | Trigger an immediate IMAP cycle (async). `202`. |
+| `GET /api/v1/status` | read | Poller state + lifetime counters + DB totals. |
+| `GET /api/v1/reports` · `/{serial}` | read | List (filters `domain`/`org`/`since`/`until`/`limit`≤500/`offset`) / full report. |
+| `GET /api/v1/reports/{serial}/raw` | read | Raw XML download (`404` if aged out). |
+| `GET /api/v1/export` | read | Stream `csv`/`jsonl` flattened report×record rows. |
+| `GET /api/v1/sources` · `/ips/{ip}` · `/domains/{domain}/sources` | read | Sender intelligence (threat list, per-IP, new senders). |
+| `GET /api/v1/domains` · `/{domain}/health` · `/{domain}/readiness` | read | Fleet grid + health score + enforcement readiness. |
+| `GET /api/v1/domains/{domain}/selectors` | read | DKIM selector inventory. |
+| `GET /api/v1/stats/timeseries` · `/stats/top` | read | Rollup analytics. |
+| `GET /api/v1/tlsrpt[/{id}]` · `/forensic[/{id}]` | read | TLS-RPT and forensic reports (forensic redacted at store time). |
+| `POST /api/v1/sources/ack` | admin | Acknowledge a `{domain, ip}` source. |
+| `GET /api/v1/audit` | admin | API audit trail (`since`/`actor`/`limit`). |
+| `POST /api/v1/requeue-failed` · `/webhooks/replay` | admin | Requeue `Failed` mail / replay deadlettered webhooks. |
+| `GET·POST /api/v1/digest/subscriptions` · `DELETE …/{id}` · `POST /digest/run` | admin | Digest subscription CRUD + force-send. |
+| `GET /api/v1/openapi.json` | — | OpenAPI 3.1 (unauthenticated). |
+| `GET /healthz` | — | `200`/`503`; body includes the watchdog `alerts` map. |
+| `GET /metrics` | — | Prometheus text format. |
 
 ### Examples
 
@@ -100,18 +128,48 @@ curl -sS "http://127.0.0.1:8081/api/v1/reports?domain=example.org&since=2026-06-
 
 ### Webhook contract
 
-When set, every newly stored report fires (3 attempts, exponential backoff):
+Signed events POST to every `PARSER_WEBHOOK_URLS` endpoint (fallback legacy
+`PARSER_WEBHOOK_URL`); 3 attempts, exponential backoff; on final failure the
+event is deadlettered (`webhook_deadletter`) and replayable via
+`POST /api/v1/webhooks/replay`.
 
 ```
-POST $PARSER_WEBHOOK_URL
+POST <each PARSER_WEBHOOK_URLS entry>
 Content-Type: application/json
-X-Parser-Event: report.ingested
+X-Parser-Event: <kind>
 X-Parser-Signature: hex(hmac-sha256(body, $PARSER_WEBHOOK_SECRET))
 
 {"event":"report.ingested","serial":157827,"domain":"example.org",
  "org":"google.com","report_id":"1234","date_begin":"…","date_end":"…",
  "records":3,"messages":17,"source":"imap"}
 ```
+
+Event kinds: `report.ingested`, `report.failed`, `sender.new`,
+`domain.anomaly`, `poller.degraded`, `tlsrpt.ingested`, `forensic.ingested`.
+
+## v2 features (brief)
+
+- **Enrichment / intelligence** — IP worker pool (`PARSER_ENRICH_WORKERS`)
+  → `ip_meta` (PTR/ASN/country/sender_class via Team Cymru DNS); `domain_source`
+  tracking; `sender.new` + `domain.anomaly` webhooks. Backfill `-backfill-sources`.
+- **Rollups / stats** — `dmarc_agg_daily` observer; `/stats/*`, `/domains*`,
+  health score (0–100), readiness verdict (enforce/step_pct/fix_alignment/
+  monitor). Backfill `-backfill-rollups`.
+- **Selectors / TLS-RPT / forensic** — `dkim_auth` selector inventory
+  (backfill `-backfill-selectors`); RFC 8460 TLS-RPT (`tlsrpt_report`/`_policy`,
+  dedup on org+report_id); RFC 6591 forensic (`forensic_report`, redacted when
+  `PARSER_RUF_REDACT`). All filed `Processed`.
+- **Export / audit** — streaming CSV/JSONL `/export` + `/reports/{serial}/raw`;
+  `parser_audit` middleware + `/audit`.
+- **Digest** — weekly per-domain HTML email (`digest_subscription`/`digest_log`)
+  over SMTP; admin CRUD + `/digest/run`.
+- **Retention** — daily ticker nulls old `raw_xml` and expunges old mail.
+- **Watchdog** — 10-min checks (silence / poll_failures / failed_spike /
+  webhook_dead) → `PARSER_ALERT_URL` + healthz `alerts` map; `alert_state`
+  cooldown.
+- **Backup** — `postgres:16-alpine` sidecar: nightly `pg_dump` + mailconfig
+  tar → `/var/backups/dmarc` (14 daily / 8 weekly); restore runbook in
+  `backup/README-backup.md`.
 
 ## Configuration (environment)
 
@@ -125,20 +183,42 @@ X-Parser-Signature: hex(hmac-sha256(body, $PARSER_WEBHOOK_SECRET))
 | `PARSER_POLL_INTERVAL` | `5m` | Go duration |
 | `PARSER_FOLDER_PROCESSED/IGNORED/FAILED` | `Processed`/`Ignored`/`Failed` | created on demand |
 | `PARSER_API_ADDR` | `:8080` | |
-| `PARSER_API_KEYS` | — | comma-separated; if empty the API refuses requests |
-| `PARSER_WEBHOOK_URL` / `PARSER_WEBHOOK_SECRET` | — | optional |
+| `PARSER_API_KEYS` | — | `name=key=scopes` (or bare key); empty = API refuses requests |
+| `PARSER_RATE_LIMIT_RPS` | `10` | per-key bucket, burst 3×; `0` disables |
+| `PARSER_WEBHOOK_URLS` / `PARSER_WEBHOOK_URL` / `PARSER_WEBHOOK_SECRET` | — | endpoints (multi/legacy) + HMAC secret |
+| `PARSER_ALERT_URL` / `PARSER_ALERT_SILENCE` / `PARSER_ALERT_FAILED_SPIKE` | — / `36h` / `10` | watchdog |
+| `PARSER_ANOMALY_SIGMA` / `_MIN_FAILS` / `PARSER_NEWSENDER_MIN_MSGS` | `3` / `50` / `5` | anomaly + new-sender |
+| `PARSER_RAW_XML_RETENTION` / `PARSER_MAIL_RETENTION` | `2160h` / `720h` | `0` = keep forever |
+| `PARSER_ENRICH_WORKERS` / `PARSER_RUF_REDACT` | `4` / `true` | enrichment / forensic redaction |
+| `PARSER_DIGEST_ENABLED` / `_SMTP_ADDR` / `_SMTP_USER` / `_FROM` / `_DAY` / `_HOUR` | `false` / `mailserver:587` / =IMAP user / =IMAP user / `Monday` / `7` | weekly digest |
+| `PARSER_VIEWER_URL` | — | viewer base URL for deep-links |
 | `PARSER_STORE_RAW_XML` | `true` | set `false` to save DB space |
 | `PARSER_MAX_BODY_BYTES` | `67108864` (64 MB) | ingest request limit |
 
 Secrets live in `/opt/dmarcparser/.env` (mode 600) and
 `/opt/dmarcparser/.mailbox-password` (mounted read-only into the container).
 
+CLI flags (run after migrations and exit; invoke flag-only via
+`docker compose run --rm --no-deps parser -<flag>`): `-backfill-rollups`,
+`-backfill-sources`, `-backfill-selectors`, `-healthcheck`.
+
+## Integrations
+
+mxsentinel / WHMCS consume the parser over HTTP (`http://dmarcparser:8080`)
+with **scoped read keys** (`name=key=read`; attributable in `/audit`), generate
+clients from `GET /api/v1/openapi.json`, optionally receive webhooks, and can
+hand customers scoped, unauthenticated viewer **share links** (`/share/{token}`)
+instead of API keys.
+
 ## Metrics
 
 `dmarcparser_mails_total{outcome=processed|ignored|failed}`,
 `dmarcparser_reports_ingested_total`, `dmarcparser_reports_duplicate_total`,
 `dmarcparser_records_inserted_total`, `dmarcparser_poll_errors_total`,
-`dmarcparser_webhook_failures_total`,
+`dmarcparser_webhook_failures_total`, `dmarcparser_webhook_deadletters_total`,
+`dmarcparser_tlsrpt_ingested_total`, `dmarcparser_forensic_ingested_total`,
+`dmarcparser_domain_anomalies_total`,
+`dmarcparser_retention_rows_purged_total{kind}`,
 `dmarcparser_last_poll_timestamp_seconds`,
 `dmarcparser_last_poll_success_timestamp_seconds`.
 
@@ -153,10 +233,16 @@ curl -s localhost:8081/healthz        # liveness
 
 The container joins three networks: its own (to reach `mailserver`),
 `dmarc_default` (to reach the viewer's `db`), and `mxsentinel_default`
-(reachable as `dmarcparser` by the mxsentinel stack).
+(reachable as `dmarcparser` by the mxsentinel stack). The `dmarc-backup`
+sidecar joins only `dmarc` (to reach `db`).
 
 ## Non-goals (for now)
 
-- Forensic (ruf) reports — they land in `Ignored`; raw mail is preserved.
-- SMTP TLS reports (`smtp-tls-rpt`) — same.
-- Schema changes — the parser writes the legacy dmarcts schema the viewer reads.
+- Schema changes to the frozen `report`/`rptrecord` tables — the parser keeps
+  writing the legacy dmarcts schema the viewer reads; v2 data is additive only.
+- MaxMind GeoIP — enrichment is Team Cymru DNS only.
+- API ingest of TLS-RPT / forensic — `/ingest` is aggregate-only; those arrive
+  via the poller.
+
+> Forensic (ruf) and SMTP TLS (RFC 8460) reports — previously non-goals — are
+> now parsed, stored, and queryable in v2.

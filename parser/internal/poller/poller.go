@@ -16,10 +16,13 @@ import (
 	"github.com/emersion/go-imap/v2/imapclient"
 
 	"dmarcparser/internal/config"
+	"dmarcparser/internal/forensic"
 	"dmarcparser/internal/mailx"
 	"dmarcparser/internal/metrics"
+	"dmarcparser/internal/pipeline"
 	"dmarcparser/internal/report"
 	"dmarcparser/internal/store"
+	"dmarcparser/internal/tlsrpt"
 	"dmarcparser/internal/webhook"
 )
 
@@ -36,6 +39,7 @@ type Poller struct {
 	store *store.Store
 	m     *metrics.Metrics
 	wh    *webhook.Notifier
+	reg   *pipeline.Registry
 	log   *slog.Logger
 	kick  chan struct{}
 
@@ -43,9 +47,27 @@ type Poller struct {
 	lastError string
 }
 
-func New(cfg *config.Config, st *store.Store, m *metrics.Metrics, wh *webhook.Notifier, log *slog.Logger) *Poller {
-	return &Poller{cfg: cfg, store: st, m: m, wh: wh, log: log.With("component", "poller"),
+func New(cfg *config.Config, st *store.Store, m *metrics.Metrics, wh *webhook.Notifier, reg *pipeline.Registry, log *slog.Logger) *Poller {
+	return &Poller{cfg: cfg, store: st, m: m, wh: wh, reg: reg,
+		log:  log.With("component", "poller"),
 		kick: make(chan struct{}, 1)}
+}
+
+// Connect dials the configured IMAP server and logs in. Shared by the
+// poller, retention expunge, and the failed-mail requeue endpoint.
+// The caller owns Close.
+func Connect(cfg *config.Config) (*imapclient.Client, error) {
+	c, err := imapclient.DialTLS(cfg.IMAPAddr, &imapclient.Options{
+		TLSConfig: &tls.Config{InsecureSkipVerify: cfg.IMAPTLSSkipVerify},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", cfg.IMAPAddr, err)
+	}
+	if err := c.Login(cfg.IMAPUser, cfg.IMAPPassword).Wait(); err != nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("login: %w", err)
+	}
+	return c, nil
 }
 
 // TriggerNow requests an immediate cycle (non-blocking; coalesces).
@@ -98,10 +120,12 @@ func (p *Poller) Run(ctx context.Context) {
 		}
 		if err := p.cycle(ctx); err != nil {
 			p.m.PollErrors.Add(1)
+			p.m.PollConsecutiveErrors.Add(1)
 			p.setError(err)
 			p.log.Error("poll cycle failed", "err", err)
 		} else {
 			p.m.LastPollSuccess.Store(time.Now().Unix())
+			p.m.PollConsecutiveErrors.Store(0)
 			p.setError(nil)
 		}
 		p.m.LastPoll.Store(time.Now().Unix())
@@ -110,17 +134,12 @@ func (p *Poller) Run(ctx context.Context) {
 }
 
 func (p *Poller) cycle(ctx context.Context) error {
-	c, err := imapclient.DialTLS(p.cfg.IMAPAddr, &imapclient.Options{
-		TLSConfig: &tls.Config{InsecureSkipVerify: p.cfg.IMAPTLSSkipVerify},
-	})
+	c, err := Connect(p.cfg)
 	if err != nil {
-		return fmt.Errorf("dial %s: %w", p.cfg.IMAPAddr, err)
+		return err
 	}
 	defer c.Close()
 
-	if err := c.Login(p.cfg.IMAPUser, p.cfg.IMAPPassword).Wait(); err != nil {
-		return fmt.Errorf("login: %w", err)
-	}
 	for _, folder := range []string{p.cfg.FolderProcessed, p.cfg.FolderIgnored, p.cfg.FolderFailed} {
 		// Ignore "already exists" errors.
 		_ = c.Create(folder, nil).Wait()
@@ -158,6 +177,7 @@ func (p *Poller) cycle(ctx context.Context) error {
 			p.log.Warn("empty body section", "uid", msg.UID, "subject", subject)
 			moves[p.cfg.FolderFailed] = append(moves[p.cfg.FolderFailed], msg.UID)
 			p.m.MailsFailed.Add(1)
+			p.notifyFailed(subject, from, "empty body section")
 			continue
 		}
 		outcome := p.processMail(ctx, raw, subject, from)
@@ -171,6 +191,7 @@ func (p *Poller) cycle(ctx context.Context) error {
 		case outcomeFailed:
 			moves[p.cfg.FolderFailed] = append(moves[p.cfg.FolderFailed], msg.UID)
 			p.m.MailsFailed.Add(1)
+			p.notifyFailed(subject, from, "unparsable report payload")
 		case outcomeRetry:
 			// leave unseen in INBOX
 		}
@@ -197,18 +218,18 @@ const (
 func (p *Poller) processMail(ctx context.Context, raw []byte, subject, from string) outcome {
 	log := p.log.With("subject", subject, "from", from)
 
-	xmls, err := mailx.ExtractReports(raw)
+	pl, err := mailx.ExtractPayloads(raw)
 	if err != nil {
 		log.Warn("unreadable report payload", "err", err)
 		return outcomeFailed
 	}
-	if len(xmls) == 0 {
+	if len(pl.Aggregates) == 0 && len(pl.TLSRPT) == 0 && len(pl.Forensic) == 0 {
 		log.Info("no report payload, ignoring")
 		return outcomeIgnored
 	}
 
 	stored, parseErrs := 0, 0
-	for _, x := range xmls {
+	for _, x := range pl.Aggregates {
 		rep, err := report.ParseXML(x)
 		if err != nil {
 			log.Warn("parse failed", "err", err)
@@ -231,16 +252,69 @@ func (p *Poller) processMail(ctx context.Context, raw []byte, subject, from stri
 		p.m.RecordsInserted.Add(int64(res.Records))
 		log.Info("report stored", "serial", res.Serial, "domain", rep.Domain,
 			"org", rep.Org, "records", res.Records, "messages", res.Messages)
-		p.wh.Notify(webhook.Event{
-			Serial: res.Serial, Domain: rep.Domain, Org: rep.Org,
-			ReportID: rep.ReportID, DateBegin: rep.Begin, DateEnd: rep.End,
-			Records: res.Records, Messages: res.Messages, Source: "imap",
+		p.reg.Emit(ctx, pipeline.IngestEvent{Report: rep, Result: res, Source: "imap"})
+	}
+
+	for _, doc := range pl.TLSRPT {
+		rep, err := tlsrpt.Parse(doc)
+		if err != nil {
+			log.Warn("tlsrpt parse failed", "err", err)
+			parseErrs++
+			continue
+		}
+		id, dup, err := p.store.SaveTLSRPT(ctx, rep, doc)
+		if err != nil {
+			log.Error("tlsrpt store failed", "org", rep.OrganizationName,
+				"report_id", rep.ReportID, "err", err)
+			return outcomeRetry
+		}
+		stored++
+		if dup {
+			log.Info("duplicate tlsrpt report", "id", id, "org", rep.OrganizationName)
+			continue
+		}
+		p.m.TLSRPTIngested.Add(1)
+		log.Info("tlsrpt report stored", "id", id,
+			"org", rep.OrganizationName, "report_id", rep.ReportID)
+		p.wh.NotifyEvent("tlsrpt.ingested", map[string]any{
+			"id": id, "org": rep.OrganizationName, "report_id": rep.ReportID,
+			"date_begin": rep.DateRange.Start, "date_end": rep.DateRange.End,
+			"policies": len(rep.Policies), "source": "imap",
 		})
 	}
+
+	for _, fp := range pl.Forensic {
+		fr, err := forensic.Parse(fp.Feedback, fp.Original, p.cfg.RUFRedact)
+		if err != nil {
+			log.Warn("forensic parse failed", "err", err)
+			parseErrs++
+			continue
+		}
+		id, err := p.store.SaveForensic(ctx, fr)
+		if err != nil {
+			log.Error("forensic store failed", "err", err)
+			return outcomeRetry
+		}
+		stored++
+		p.m.ForensicIngested.Add(1)
+		log.Info("forensic report stored", "id", id)
+		p.wh.NotifyEvent("forensic.ingested", map[string]any{
+			"id": id, "feedback_type": fr.FeedbackType, "auth_failure": fr.AuthFailure,
+			"source_ip": fr.SourceIP, "reported_domain": fr.ReportedDomain,
+			"source": "imap",
+		})
+	}
+
 	if stored == 0 && parseErrs > 0 {
 		return outcomeFailed
 	}
 	return outcomeProcessed
+}
+
+func (p *Poller) notifyFailed(subject, from, reason string) {
+	p.wh.NotifyEvent("report.failed", map[string]string{
+		"subject": subject, "from": from, "reason": reason,
+	})
 }
 
 func envelopeInfo(msg *imapclient.FetchMessageBuffer) (subject, from string) {

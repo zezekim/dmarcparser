@@ -1,0 +1,3011 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "dmarc-parser API",
+    "version": "2.0.0",
+    "description": "REST API of the DMARC aggregate report parser & ingestion service.\n\n### Authentication\nEvery `/api/v1/*` route (except `/api/v1/openapi.json`) requires an API\nkey from `PARSER_API_KEYS`, sent either as `Authorization: Bearer <key>`\nor `X-API-Key: <key>`. Keys carry scopes from `{read, ingest, admin}`;\neach operation documents its required scope via `x-required-scope`.\nMissing/invalid key \u2192 401; key without the required scope \u2192 403.\n\n### Rate limiting\nPer-key token bucket (`PARSER_RATE_LIMIT_RPS`, default 10 req/s,\nburst 3x). Exceeding it returns 429 with a `Retry-After` header.\n\n### Conventions\nAll timestamps are UTC, RFC 3339. Date-only values accepted by `since` /\n`until` parameters use `YYYY-MM-DD`. Errors are JSON\n`{\"error\": \"message\"}`.\n"
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8081",
+      "description": "Host loopback"
+    },
+    {
+      "url": "http://dmarcparser:8080",
+      "description": "From containers on the mxsentinel_default / dmarcparser_default networks"
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    },
+    {
+      "apiKeyAuth": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "system",
+      "description": "Health, metrics and API description (unauthenticated)"
+    },
+    {
+      "name": "ingest",
+      "description": "Report ingestion"
+    },
+    {
+      "name": "poller",
+      "description": "IMAP poller control and status"
+    },
+    {
+      "name": "reports",
+      "description": "Stored aggregate reports"
+    },
+    {
+      "name": "export",
+      "description": "Bulk data export"
+    },
+    {
+      "name": "intel",
+      "description": "Sender intelligence (sources, IP metadata, new-sender tracking)"
+    },
+    {
+      "name": "stats",
+      "description": "Rollup analytics, domain health and enforcement readiness"
+    },
+    {
+      "name": "reports2",
+      "description": "DKIM selectors, TLS-RPT and forensic (ruf) reports"
+    },
+    {
+      "name": "audit",
+      "description": "API audit trail"
+    },
+    {
+      "name": "webhooks",
+      "description": "Webhook deadletter replay"
+    },
+    {
+      "name": "digest",
+      "description": "Weekly email digest subscriptions"
+    }
+  ],
+  "paths": {
+    "/healthz": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Liveness / readiness",
+        "description": "200 when the DB is reachable and the last successful poll is recent; 503 otherwise. Includes per-rule watchdog alert states.\n",
+        "operationId": "getHealthz",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Degraded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Prometheus metrics",
+        "operationId": "getMetrics",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Prometheus text exposition format",
+            "content": {
+              "text/plain": {}
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/openapi.json": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "This API description (JSON)",
+        "operationId": "getOpenAPI",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "OpenAPI 3.1 document",
+            "content": {
+              "application/json": {}
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/ingest": {
+      "post": {
+        "tags": [
+          "ingest"
+        ],
+        "summary": "Ingest DMARC aggregate report(s)",
+        "description": "Body may be raw XML, gzip, or zip (any Content-Type), or multipart/form-data with a file field. Zip archives may contain multiple reports; all are processed. Duplicates (same domain + report_id) are no-ops returning the existing serial.\n",
+        "operationId": "ingestReport",
+        "x-required-scope": "ingest",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "At least one new report stored",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestResponse"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Every report was a duplicate",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/poll": {
+      "post": {
+        "tags": [
+          "poller"
+        ],
+        "summary": "Trigger an immediate IMAP poll cycle (async)",
+        "operationId": "triggerPoll",
+        "x-required-scope": "admin",
+        "responses": {
+          "202": {
+            "description": "Poll triggered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "const": "poll triggered"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/status": {
+      "get": {
+        "tags": [
+          "poller"
+        ],
+        "summary": "Poller state, lifetime counters and DB totals",
+        "operationId": "getStatus",
+        "x-required-scope": "read",
+        "responses": {
+          "200": {
+            "description": "Status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/reports": {
+      "get": {
+        "tags": [
+          "reports"
+        ],
+        "summary": "List stored reports",
+        "operationId": "listReports",
+        "x-required-scope": "read",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/domain"
+          },
+          {
+            "$ref": "#/components/parameters/org"
+          },
+          {
+            "$ref": "#/components/parameters/since"
+          },
+          {
+            "$ref": "#/components/parameters/until"
+          },
+          {
+            "$ref": "#/components/parameters/limit500"
+          },
+          {
+            "$ref": "#/components/parameters/offset"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Report summaries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "reports": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ReportSummary"
+                      }
+                    },
+                    "limit": {
+                      "type": "integer"
+                    },
+                    "offset": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/reports/{serial}": {
+      "get": {
+        "tags": [
+          "reports"
+        ],
+        "summary": "One report including all records",
+        "operationId": "getReport",
+        "x-required-scope": "read",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/serial"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Report detail",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReportDetail"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/reports/{serial}/raw": {
+      "get": {
+        "tags": [
+          "reports",
+          "export"
+        ],
+        "summary": "Download the raw report XML",
+        "description": "404 when the serial is unknown or raw_xml was purged by the retention job (PARSER_RAW_XML_RETENTION).\n",
+        "operationId": "getReportRaw",
+        "x-required-scope": "read",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/serial"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Raw XML attachment",
+            "content": {
+              "text/xml": {}
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/export": {
+      "get": {
+        "tags": [
+          "export"
+        ],
+        "summary": "Stream flattened report\u00d7record rows (CSV or JSONL)",
+        "description": "Chunked streaming export of every record row matching the filters, joined with its report metadata. CSV has a header row; JSONL emits one ExportRow object per line.\n",
+        "operationId": "exportRecords",
+        "x-required-scope": "read",
+        "parameters": [
+          {
+            "name": "format",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "csv",
+                "jsonl"
+              ],
+              "default": "csv"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/domain"
+          },
+          {
+            "$ref": "#/components/parameters/org"
+          },
+          {
+            "$ref": "#/components/parameters/since"
+          },
+          {
+            "$ref": "#/components/parameters/until"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Streamed export",
+            "content": {
+              "text/csv": {},
+              "application/x-ndjson": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExportRow"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/sources": {
+      "get": {
+        "tags": [
+          "intel"
+        ],
+        "summary": "Threat list of sending IPs across all domains",
+        "description": "Per-IP totals, failed message counts, targeted domain count and ip_meta enrichment, ordered by failing messages descending.",
+        "operationId": "listSources",
+        "x-required-scope": "read",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/domain"
+          },
+          {
+            "name": "min_failed",
+            "in": "query",
+            "description": "Only IPs with at least this many failing messages",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "$ref": "#/components/parameters/since"
+          },
+          {
+            "$ref": "#/components/parameters/limit1000"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Source list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "sources": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Source"
+                      }
+                    },
+                    "limit": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/ips/{ip}": {
+      "get": {
+        "tags": [
+          "intel"
+        ],
+        "summary": "Cross-report activity and metadata for one IP",
+        "operationId": "getIP",
+        "x-required-scope": "read",
+        "parameters": [
+          {
+            "name": "ip",
+            "in": "path",
+            "required": true,
+            "description": "IPv4 or IPv6 address (v4-mapped v6 is unmapped)",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "IP drill-down",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IPDetail"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/domains": {
+      "get": {
+        "tags": [
+          "stats"
+        ],
+        "summary": "Domain overview with 30d volume, alignment, policy and health score",
+        "operationId": "listDomains",
+        "x-required-scope": "read",
+        "responses": {
+          "200": {
+            "description": "Domain list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "domains": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/DomainOverview"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/sources": {
+      "get": {
+        "tags": [
+          "intel"
+        ],
+        "summary": "Sending sources of one domain",
+        "operationId": "getDomainSources",
+        "x-required-scope": "read",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/domainPath"
+          },
+          {
+            "name": "unacked",
+            "in": "query",
+            "description": "Only sources not yet acknowledged",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Domain sources",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "domain": {
+                      "type": "string"
+                    },
+                    "unacked_only": {
+                      "type": "boolean"
+                    },
+                    "sources": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/DomainSource"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/health": {
+      "get": {
+        "tags": [
+          "stats"
+        ],
+        "summary": "Health score (0\u2013100) with component breakdown",
+        "description": "Weights: alignment 40, trend 15, policy strength 20, coverage 10, unknown-source failing volume 15.",
+        "operationId": "getDomainHealth",
+        "x-required-scope": "read",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/domainPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Health breakdown",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "domain": {
+                      "type": "string"
+                    },
+                    "score": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 100
+                    },
+                    "components": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/HealthComponent"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/readiness": {
+      "get": {
+        "tags": [
+          "stats"
+        ],
+        "summary": "Policy enforcement readiness verdict",
+        "description": "Pure rule engine over 30/90-day alignment and failing sources. Recommendation is one of enforce | step_pct | fix_alignment | monitor.\n",
+        "operationId": "getDomainReadiness",
+        "x-required-scope": "read",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/domainPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Readiness verdict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Readiness"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/selectors": {
+      "get": {
+        "tags": [
+          "reports2"
+        ],
+        "summary": "DKIM selector inventory for one domain",
+        "operationId": "getDomainSelectors",
+        "x-required-scope": "read",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/domainPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Selector inventory with first/last seen and pass/fail counts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "domain": {
+                      "type": "string"
+                    },
+                    "selectors": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Selector"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/sources/ack": {
+      "post": {
+        "tags": [
+          "intel"
+        ],
+        "summary": "Acknowledge a (domain, ip) source",
+        "description": "Acked sources stop being reported as new senders.",
+        "operationId": "ackSource",
+        "x-required-scope": "admin",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "domain",
+                  "ip"
+                ],
+                "properties": {
+                  "domain": {
+                    "type": "string"
+                  },
+                  "ip": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Acknowledged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "const": "acked"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/stats/timeseries": {
+      "get": {
+        "tags": [
+          "stats"
+        ],
+        "summary": "Message volume / alignment timeseries from daily rollups",
+        "operationId": "getStatsTimeseries",
+        "x-required-scope": "read",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/domain"
+          },
+          {
+            "name": "bucket",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "day",
+                "week"
+              ],
+              "default": "day"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/since"
+          },
+          {
+            "$ref": "#/components/parameters/until"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Timeseries points",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "bucket": {
+                      "type": "string",
+                      "enum": [
+                        "day",
+                        "week"
+                      ]
+                    },
+                    "points": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/TimeseriesPoint"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/stats/top": {
+      "get": {
+        "tags": [
+          "stats"
+        ],
+        "summary": "Top senders along one dimension",
+        "operationId": "getStatsTop",
+        "x-required-scope": "read",
+        "parameters": [
+          {
+            "name": "dimension",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "ip",
+                "org",
+                "header_from"
+              ],
+              "default": "ip"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/domain"
+          },
+          {
+            "$ref": "#/components/parameters/since"
+          },
+          {
+            "$ref": "#/components/parameters/until"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
+            }
+          },
+          {
+            "name": "failing",
+            "in": "query",
+            "description": "Restrict to fully unaligned records",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Ranked rows",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "dimension": {
+                      "type": "string",
+                      "enum": [
+                        "ip",
+                        "org",
+                        "header_from"
+                      ]
+                    },
+                    "failing": {
+                      "type": "boolean"
+                    },
+                    "rows": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/TopRow"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/tlsrpt": {
+      "get": {
+        "tags": [
+          "reports2"
+        ],
+        "summary": "List SMTP TLS (RFC 8460) reports",
+        "operationId": "listTLSRPT",
+        "x-required-scope": "read",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "query",
+            "description": "Filter by policy domain",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/org"
+          },
+          {
+            "$ref": "#/components/parameters/since"
+          },
+          {
+            "$ref": "#/components/parameters/until"
+          },
+          {
+            "$ref": "#/components/parameters/limit500"
+          },
+          {
+            "$ref": "#/components/parameters/offset"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "TLS-RPT report summaries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "reports": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/TLSRPTSummary"
+                      }
+                    },
+                    "limit": {
+                      "type": "integer"
+                    },
+                    "offset": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/tlsrpt/{id}": {
+      "get": {
+        "tags": [
+          "reports2"
+        ],
+        "summary": "One TLS-RPT report with per-policy rows",
+        "operationId": "getTLSRPT",
+        "x-required-scope": "read",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "TLS-RPT detail",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TLSRPTDetail"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/forensic": {
+      "get": {
+        "tags": [
+          "reports2"
+        ],
+        "summary": "List forensic (ruf) reports",
+        "description": "Recipient localparts are redacted at store time when PARSER_RUF_REDACT is on.",
+        "operationId": "listForensic",
+        "x-required-scope": "read",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "query",
+            "description": "Filter by reported domain",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/since"
+          },
+          {
+            "$ref": "#/components/parameters/until"
+          },
+          {
+            "$ref": "#/components/parameters/limit500"
+          },
+          {
+            "$ref": "#/components/parameters/offset"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Forensic report list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "reports": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ForensicReport"
+                      }
+                    },
+                    "limit": {
+                      "type": "integer"
+                    },
+                    "offset": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/forensic/{id}": {
+      "get": {
+        "tags": [
+          "reports2"
+        ],
+        "summary": "One forensic report (includes raw headers)",
+        "operationId": "getForensic",
+        "x-required-scope": "read",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Forensic report",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForensicReport"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/audit": {
+      "get": {
+        "tags": [
+          "audit"
+        ],
+        "summary": "Query the API audit trail",
+        "operationId": "listAudit",
+        "x-required-scope": "admin",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/since"
+          },
+          {
+            "name": "actor",
+            "in": "query",
+            "description": "Filter by API key name",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/limit1000"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Audit entries, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "entries": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/AuditEntry"
+                      }
+                    },
+                    "limit": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/requeue-failed": {
+      "post": {
+        "tags": [
+          "poller"
+        ],
+        "summary": "Requeue all mail from the Failed folder",
+        "description": "Moves every message in the Failed IMAP folder back to INBOX (cleared of \\Seen) and triggers an immediate poll cycle.\n",
+        "operationId": "requeueFailed",
+        "x-required-scope": "admin",
+        "responses": {
+          "200": {
+            "description": "Requeue result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "requeued": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "description": "Poller disabled (PARSER_IMAP_ADDR empty)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "502": {
+            "description": "IMAP operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/webhooks/replay": {
+      "post": {
+        "tags": [
+          "webhooks"
+        ],
+        "summary": "Re-deliver dead-lettered webhooks",
+        "description": "Attempts one synchronous delivery for every un-replayed webhook_deadletter row (oldest first, max 500 per call); successful deliveries are marked replayed.\n",
+        "operationId": "replayWebhooks",
+        "x-required-scope": "admin",
+        "responses": {
+          "200": {
+            "description": "Replay result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "pending": {
+                      "type": "integer",
+                      "description": "Rows attempted in this call"
+                    },
+                    "replayed": {
+                      "type": "integer"
+                    },
+                    "failed": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/digest/subscriptions": {
+      "get": {
+        "tags": [
+          "digest"
+        ],
+        "summary": "List digest subscriptions",
+        "operationId": "listDigestSubscriptions",
+        "x-required-scope": "admin",
+        "responses": {
+          "200": {
+            "description": "Subscriptions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "subscriptions": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/DigestSubscription"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "digest"
+        ],
+        "summary": "Subscribe an email address to a domain's weekly digest",
+        "operationId": "addDigestSubscription",
+        "x-required-scope": "admin",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "domain",
+                  "email"
+                ],
+                "properties": {
+                  "domain": {
+                    "type": "string"
+                  },
+                  "email": {
+                    "type": "string",
+                    "format": "email"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DigestSubscription"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Already existed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DigestSubscription"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/digest/subscriptions/{id}": {
+      "delete": {
+        "tags": [
+          "digest"
+        ],
+        "summary": "Delete a digest subscription",
+        "operationId": "deleteDigestSubscription",
+        "x-required-scope": "admin",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/id"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "const": "deleted"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/api/v1/digest/run": {
+      "post": {
+        "tags": [
+          "digest"
+        ],
+        "summary": "Force-send all digests now",
+        "description": "Sends a digest for every subscription immediately, bypassing the weekly schedule guard. Intended for testing.",
+        "operationId": "runDigest",
+        "x-required-scope": "admin",
+        "responses": {
+          "200": {
+            "description": "Run summary",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DigestRunSummary"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "description": "Run failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "API key from PARSER_API_KEYS as a bearer token. Key scopes: read, ingest, admin (see each operation's x-required-scope)."
+      },
+      "apiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+        "description": "Same API key via the X-API-Key header."
+      }
+    },
+    "parameters": {
+      "domain": {
+        "name": "domain",
+        "in": "query",
+        "description": "Filter by policy-published domain",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "org": {
+        "name": "org",
+        "in": "query",
+        "description": "Filter by reporting organisation",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "since": {
+        "name": "since",
+        "in": "query",
+        "description": "Lower time bound (RFC 3339 or YYYY-MM-DD)",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "until": {
+        "name": "until",
+        "in": "query",
+        "description": "Upper time bound (RFC 3339 or YYYY-MM-DD)",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "limit500": {
+        "name": "limit",
+        "in": "query",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "default": 50
+        }
+      },
+      "limit1000": {
+        "name": "limit",
+        "in": "query",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000,
+          "default": 100
+        }
+      },
+      "offset": {
+        "name": "offset",
+        "in": "query",
+        "schema": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        }
+      },
+      "serial": {
+        "name": "serial",
+        "in": "path",
+        "required": true,
+        "description": "Report serial",
+        "schema": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "id": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "domainPath": {
+        "name": "domain",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Malformed request",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Missing or invalid API key",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "API key lacks the required scope",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Not found",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "TooManyRequests": {
+        "description": "Per-key rate limit exceeded (see Retry-After)",
+        "headers": {
+          "Retry-After": {
+            "description": "Seconds to wait before retrying",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "Health": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "degraded"
+            ]
+          },
+          "db": {
+            "type": "string"
+          },
+          "poller": {
+            "type": "string"
+          },
+          "alerts": {
+            "type": "object",
+            "description": "Watchdog rule states (silence, poll_failures, failed_spike, webhook_dead)",
+            "additionalProperties": {
+              "type": "string",
+              "enum": [
+                "ok",
+                "firing"
+              ]
+            }
+          }
+        }
+      },
+      "IngestResponse": {
+        "type": "object",
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "serial": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "domain": {
+                  "type": "string"
+                },
+                "org": {
+                  "type": "string"
+                },
+                "report_id": {
+                  "type": "string"
+                },
+                "records": {
+                  "type": "integer"
+                },
+                "messages": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "duplicate": {
+                  "type": "boolean"
+                }
+              }
+            }
+          }
+        }
+      },
+      "StatusResponse": {
+        "type": "object",
+        "properties": {
+          "poller": {
+            "type": "object",
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "interval": {
+                "type": "string"
+              },
+              "last_poll": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "date-time"
+              },
+              "last_success": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "date-time"
+              },
+              "last_error": {
+                "type": "string"
+              }
+            }
+          },
+          "counters": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          "database": {
+            "type": "object",
+            "properties": {
+              "reports": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "records": {
+                "type": "integer",
+                "format": "int64"
+              }
+            }
+          }
+        }
+      },
+      "ReportSummary": {
+        "type": "object",
+        "properties": {
+          "serial": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "org": {
+            "type": "string"
+          },
+          "domain": {
+            "type": "string"
+          },
+          "report_id": {
+            "type": "string"
+          },
+          "date_begin": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "date_end": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "records": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "messages": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "Record": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "source_ip": {
+            "type": "string"
+          },
+          "count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "disposition": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dkim_domain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dkim_result": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "spf_domain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "spf_result": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "spf_align": {
+            "type": "string"
+          },
+          "dkim_align": {
+            "type": "string"
+          },
+          "header_from": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ReportDetail": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ReportSummary"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "email": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "extra_contact_info": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "policy_adkim": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "policy_aspf": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "policy_p": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "policy_sp": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "policy_pct": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "record_rows": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Record"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "ExportRow": {
+        "type": "object",
+        "description": "One flattened report\u00d7record row (JSONL export; CSV columns match in order)",
+        "properties": {
+          "serial": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "domain": {
+            "type": "string"
+          },
+          "org": {
+            "type": "string"
+          },
+          "report_id": {
+            "type": "string"
+          },
+          "date_begin": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "date_end": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "source_ip": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "disposition": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dkim_align": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "spf_align": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dkim_domain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dkim_result": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "spf_domain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "spf_result": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "header_from": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Source": {
+        "type": "object",
+        "properties": {
+          "ip": {
+            "type": "string"
+          },
+          "msgs_total": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "msgs_failed": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "domains": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Distinct domains targeted"
+          },
+          "first_seen": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_seen": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "ptr": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "asn": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "as_org": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "country": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sender_class": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "IPMeta": {
+        "type": "object",
+        "properties": {
+          "ip": {
+            "type": "string"
+          },
+          "ptr": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "asn": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "as_org": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "country": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sender_class": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "first_seen": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "refreshed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        }
+      },
+      "DomainSource": {
+        "type": "object",
+        "properties": {
+          "domain": {
+            "type": "string"
+          },
+          "ip": {
+            "type": "string"
+          },
+          "first_seen": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_seen": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "first_serial": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "msg_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "aligned_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "acked": {
+            "type": "boolean"
+          },
+          "ptr": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "asn": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "as_org": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "country": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sender_class": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "IPReportActivity": {
+        "type": "object",
+        "properties": {
+          "serial": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "domain": {
+            "type": "string"
+          },
+          "org": {
+            "type": "string"
+          },
+          "date_begin": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "date_end": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "messages": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "disposition": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dkim_align": {
+            "type": "string"
+          },
+          "spf_align": {
+            "type": "string"
+          },
+          "header_from": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "IPDetail": {
+        "type": "object",
+        "properties": {
+          "ip": {
+            "type": "string"
+          },
+          "meta": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/IPMeta"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "domains": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DomainSource"
+            }
+          },
+          "reports": {
+            "type": "array",
+            "description": "Latest 100 report records featuring this IP",
+            "items": {
+              "$ref": "#/components/schemas/IPReportActivity"
+            }
+          }
+        }
+      },
+      "TimeseriesPoint": {
+        "type": "object",
+        "properties": {
+          "bucket": {
+            "type": "string",
+            "description": "Bucket start date (YYYY-MM-DD)"
+          },
+          "msgs_total": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "msgs_aligned": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "pass_rate": {
+            "type": "number"
+          },
+          "msgs_none": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "msgs_quarantine": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "msgs_reject": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "TopRow": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "Dimension value (ip",
+            "org or header_from)": null
+          },
+          "msgs": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "msgs_failed": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "reports": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "DomainOverview": {
+        "type": "object",
+        "properties": {
+          "domain": {
+            "type": "string"
+          },
+          "msgs_30d": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "aligned_rate_30d": {
+            "type": "number"
+          },
+          "last_report": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "policy_p": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "policy_sp": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "policy_pct": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "health": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          }
+        }
+      },
+      "HealthComponent": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "score": {
+            "type": "number"
+          },
+          "max": {
+            "type": "number"
+          },
+          "detail": {
+            "type": "string"
+          }
+        }
+      },
+      "FailSource": {
+        "type": "object",
+        "properties": {
+          "ip": {
+            "type": "string"
+          },
+          "msgs": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "ptr": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "as_org": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sender_class": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Readiness": {
+        "type": "object",
+        "properties": {
+          "domain": {
+            "type": "string"
+          },
+          "aligned_rate_30d": {
+            "type": "number"
+          },
+          "aligned_rate_90d": {
+            "type": "number"
+          },
+          "msgs_30d": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "msgs_90d": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "fail_sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FailSource"
+            }
+          },
+          "current_policy": {
+            "type": "object",
+            "properties": {
+              "p": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "sp": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "pct": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            }
+          },
+          "recommendation": {
+            "type": "string",
+            "enum": [
+              "enforce",
+              "step_pct",
+              "fix_alignment",
+              "monitor"
+            ]
+          },
+          "blockers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "Selector": {
+        "type": "object",
+        "properties": {
+          "dkim_domain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "selector": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "first_seen": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "last_seen": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "pass_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "fail_count": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "TLSRPTSummary": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "org": {
+            "type": "string"
+          },
+          "report_id": {
+            "type": "string"
+          },
+          "contact": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "date_begin": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "date_end": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "seen": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "policies": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "success_total": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "failure_total": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "TLSRPTPolicyRow": {
+        "type": "object",
+        "properties": {
+          "policy_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "policy_domain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mx_host": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "success_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "failure_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "failure_details": {}
+        }
+      },
+      "TLSRPTDetail": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/TLSRPTSummary"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "policy_rows": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/TLSRPTPolicyRow"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "ForensicReport": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "seen": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "feedback_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "auth_failure": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_ip": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reported_domain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "original_mail_from": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "arrival_date": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "subject": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "header_from": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "raw_headers": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Only present on the single-report endpoint"
+          }
+        }
+      },
+      "AuditEntry": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "ts": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "actor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "API key name"
+          },
+          "action": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "HTTP method"
+          },
+          "route": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Route pattern"
+          },
+          "status": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "client_ip": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "detail": {
+            "description": "Extra context, e.g. {\"serials\":[...]} for ingests",
+            "oneOf": [
+              {
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "DigestSubscription": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "domain": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string"
+          }
+        }
+      },
+      "DigestRunSummary": {
+        "type": "object",
+        "properties": {
+          "domains_sent": {
+            "type": "integer"
+          },
+          "domains_skipped": {
+            "type": "integer"
+          },
+          "emails_sent": {
+            "type": "integer"
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  }
+}

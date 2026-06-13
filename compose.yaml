@@ -6,8 +6,8 @@ services:
     ports:
       # Host Postfix owns port 25 and relays the report domains here.
       - "127.0.0.1:2525:25"
-      # IMAPS for external mail clients (Thunderbird etc.), optional.
-      - "993:993"
+      # IMAPS, host-local only (parser + roundcube reach it on the network).
+      - "127.0.0.1:993:993"
     volumes:
       - ./docker-data/dms/mail-data/:/var/mail/
       - ./docker-data/dms/mail-state/:/var/mail-state/
@@ -79,9 +79,28 @@ services:
       - PARSER_IMAP_PASSWORD_FILE=/run/secrets/mailbox-password
       # The mailserver cert is self-signed.
       - PARSER_IMAP_TLS_SKIP_VERIFY=true
-      - PARSER_POLL_INTERVAL=5m
+      - PARSER_POLL_INTERVAL=${PARSER_POLL_INTERVAL:-5m}
       - PARSER_WEBHOOK_URL=${PARSER_WEBHOOK_URL:-}
+      - PARSER_WEBHOOK_URLS=${PARSER_WEBHOOK_URLS:-}
       - PARSER_WEBHOOK_SECRET=${PARSER_WEBHOOK_SECRET:-}
+      - PARSER_RATE_LIMIT_RPS=${PARSER_RATE_LIMIT_RPS:-10}
+      - PARSER_ALERT_URL=${PARSER_ALERT_URL:-}
+      - PARSER_ALERT_SILENCE=${PARSER_ALERT_SILENCE:-36h}
+      - PARSER_ALERT_FAILED_SPIKE=${PARSER_ALERT_FAILED_SPIKE:-10}
+      - PARSER_ANOMALY_SIGMA=${PARSER_ANOMALY_SIGMA:-3}
+      - PARSER_ANOMALY_MIN_FAILS=${PARSER_ANOMALY_MIN_FAILS:-50}
+      - PARSER_NEWSENDER_MIN_MSGS=${PARSER_NEWSENDER_MIN_MSGS:-5}
+      - PARSER_RAW_XML_RETENTION=${PARSER_RAW_XML_RETENTION:-2160h}
+      - PARSER_MAIL_RETENTION=${PARSER_MAIL_RETENTION:-720h}
+      - PARSER_RUF_REDACT=${PARSER_RUF_REDACT:-true}
+      - PARSER_ENRICH_WORKERS=${PARSER_ENRICH_WORKERS:-4}
+      - PARSER_DIGEST_ENABLED=${PARSER_DIGEST_ENABLED:-false}
+      - PARSER_DIGEST_SMTP_ADDR=${PARSER_DIGEST_SMTP_ADDR:-mailserver:587}
+      - PARSER_DIGEST_SMTP_USER=${PARSER_DIGEST_SMTP_USER:-}
+      - PARSER_DIGEST_FROM=${PARSER_DIGEST_FROM:-}
+      - PARSER_DIGEST_DAY=${PARSER_DIGEST_DAY:-Monday}
+      - PARSER_DIGEST_HOUR=${PARSER_DIGEST_HOUR:-7}
+      - PARSER_VIEWER_URL=${PARSER_VIEWER_URL:-}
     volumes:
       - ./.mailbox-password:/run/secrets/mailbox-password:ro
     ports:
@@ -93,7 +112,49 @@ services:
       mxsentinel:
         aliases:
           - dmarcparser
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/dmarc-parser", "-healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
+
+  # Nightly pg_dump + mailserver-config backup sidecar (see backup/README-backup.md).
+  backup:
+    image: postgres:16-alpine
+    container_name: dmarc-backup
+    entrypoint: ["/bin/sh", "/opt/backup/entrypoint.sh"]
+    environment:
+      - PARSER_DATABASE_URL=${PARSER_DATABASE_URL}
+      - TZ=UTC
+      # Optional overrides (defaults in backup.sh):
+      # BACKUP_DIR=/backups MAILCONFIG_DIR=/mailconfig
+      # KEEP_DAILY=14 KEEP_WEEKLY=8 WEEKLY_DOW=7
+    volumes:
+      - ./backup:/opt/backup:ro
+      - ./docker-data/dms/config:/mailconfig:ro
+      - /var/backups/dmarc:/backups
+    networks:
+      - dmarc
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    healthcheck:
+      # Unhealthy when the last successful backup is older than 26h
+      # (daily run at 03:15 UTC + slack for one retry window).
+      test: ["CMD-SHELL", "find /backups/.last-success -mmin -1560 | grep -q ."]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 15m
 
 volumes:
   roundcube-db:

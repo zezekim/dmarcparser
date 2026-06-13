@@ -1,0 +1,7 @@
+# dmarc backup sidecar crontab (busybox crond, /etc/crontabs/root).
+# All times UTC (TZ=UTC in compose). Output goes to the container log via
+# /proc/1/fd/1 (crond runs as PID 1, see entrypoint.sh).
+#
+# m  h  dom mon dow  command
+15 3 * * * /bin/sh /opt/backup/backup.sh >/proc/1/fd/1 2>&1
+45 4 * * 1 /bin/sh /opt/backup/verify.sh >/proc/1/fd/1 2>&1

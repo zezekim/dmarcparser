@@ -4,9 +4,11 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -17,6 +19,8 @@ import (
 
 type Store struct {
 	pool *pgxpool.Pool
+
+	lastInsert atomic.Int64 // unix seconds of last successful non-duplicate insert
 }
 
 func New(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
@@ -33,8 +37,8 @@ type SaveResult struct {
 const insertReportSQL = `
 	INSERT INTO report (mindate, maxdate, domain, org, reportid, email,
 	                    extra_contact_info, policy_adkim, policy_aspf,
-	                    policy_p, policy_sp, policy_pct, raw_xml)
-	VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+	                    policy_p, policy_sp, policy_pct, raw_xml, seen)
+	VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now())
 	ON CONFLICT (domain, reportid) DO NOTHING
 	RETURNING serial`
 
@@ -97,7 +101,66 @@ func (s *Store) SaveReport(ctx context.Context, r *report.Report, storeRaw bool)
 	if err := tx.Commit(ctx); err != nil {
 		return res, err
 	}
+	s.lastInsert.Store(time.Now().Unix())
 	return res, nil
+}
+
+// LastIngestAt returns the time of the most recent stored report: max(seen)
+// from the database, or the in-memory last-insert mark if that is newer.
+func (s *Store) LastIngestAt(ctx context.Context) (time.Time, error) {
+	var seen *time.Time
+	if err := s.pool.QueryRow(ctx, `SELECT max(seen) FROM report`).Scan(&seen); err != nil {
+		return time.Time{}, err
+	}
+	var t time.Time
+	if seen != nil {
+		t = seen.UTC()
+	}
+	if mem := s.lastInsert.Load(); mem > 0 {
+		if mt := time.Unix(mem, 0).UTC(); mt.After(t) {
+			t = mt
+		}
+	}
+	return t, nil
+}
+
+// InsertWebhookDeadletter records a webhook delivery that exhausted all
+// retries so it can be replayed later.
+func (s *Store) InsertWebhookDeadletter(ctx context.Context, endpoint, kind string, payload []byte, lastErr string) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO webhook_deadletter (endpoint, kind, payload, last_error) VALUES ($1,$2,$3,$4)`,
+		endpoint, kind, payload, lastErr)
+	return err
+}
+
+// AlertLastFired returns when a rule last fired (zero time if never).
+func (s *Store) AlertLastFired(ctx context.Context, rule string) (time.Time, error) {
+	var t *time.Time
+	err := s.pool.QueryRow(ctx,
+		`SELECT last_fired FROM alert_state WHERE rule=$1`, rule).Scan(&t)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	if t == nil {
+		return time.Time{}, nil
+	}
+	return t.UTC(), nil
+}
+
+// MarkAlertFired upserts the cooldown timestamp + detail for a rule.
+func (s *Store) MarkAlertFired(ctx context.Context, rule string, detail any) error {
+	b, err := json.Marshal(detail)
+	if err != nil {
+		b = []byte("null")
+	}
+	_, err = s.pool.Exec(ctx, `
+		INSERT INTO alert_state (rule, last_fired, detail) VALUES ($1, now(), $2)
+		ON CONFLICT (rule) DO UPDATE SET last_fired = now(), detail = EXCLUDED.detail`,
+		rule, b)
+	return err
 }
 
 // --- Query API ---
